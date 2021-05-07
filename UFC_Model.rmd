@@ -1,0 +1,494 @@
+---
+title: "UFC_Model"
+output: html_document
+---
+
+###Packages
+```{r}
+library(Ckmeans.1d.dp)
+library(dials)
+library(dplyr)
+library(gbm)
+library(ggplot2)
+library(lubridate)
+library(purrr)
+library(randomForest)
+library(readr)
+library(tidyverse)
+library(tidymodels)
+library(tidyr)
+library(tree)
+library(vtreat)
+library(xgboost)
+```
+
+###Load data (note these were on Kaggle and I just downloaded to my documents)
+```{r}
+UFC_Data <- function(working.directory) {
+        ###Set your working directory
+        setwd(working.directory)
+  
+        ###https://www.kaggle.com/rajeevw/ufcdata?select=data.csv
+        Fighter_Data <- read.csv("Fighter_Data.csv")
+        
+        ###https://www.kaggle.com/mdabbert/ufc-fights-2010-2020-with-betting-odds
+        Fighter_Odds <- read.csv("Fighter_Odds.csv") 
+        
+        ###Clean up odds for merging
+        Fighter_Odds <- rename(Fighter_Odds, R_fighter = "ï..R_fighter") 
+        Fighter_Odds  <- Fighter_Odds %>%
+          dplyr::select(R_fighter, B_fighter, R_odds, B_odds, date)
+        
+        ###Merge odds data with fights
+        UFC_Fight_Data <- merge(Fighter_Data, Fighter_Odds, by = c("R_fighter", "B_fighter", "date")) %>%
+          arrange(date) %>%
+          mutate(fight_id = row_number())
+        
+        ###Split our data into B fighers data and R fighters data
+        B_Fighters <- UFC_Fight_Data %>%
+          dplyr::select(2:75, 143,146:147) %>%
+          mutate(Winner = ifelse(Winner == "Red", 0,1)) %>%
+          rename_at(8:length(.), list(~ substr(., 3, nchar(.)))) %>%
+          rename("Fight_ID" = "ght_id") %>%
+          rename("Fighter" = "B_fighter")
+        
+        R_Fighters <- UFC_Fight_Data %>%
+          dplyr::select(1,3:8,76:142, 144:145,147) %>%
+          mutate(Winner = ifelse(Winner == "Red", 1,0)) %>%
+          rename_at(8:length(.), list(~ substr(., 3, nchar(.)))) %>%
+          rename("Fight_ID" = "ght_id") %>%
+          rename("Fighter" = "R_fighter")
+        
+        ###Add our data frames together
+        Fight_Data <- rbind(B_Fighters, R_Fighters)
+        
+        return(Fight_Data)
+}
+
+Fight_Data <- UFC_Data("C:\\Users\\50259\\Documents")
+```
+
+###Check out NA's and continue cleaning
+```{r}
+###Looks like we are missing a few reach values so we can predict those with height
+sapply(Fight_Data, function(x) sum(is.na(x)))
+
+###Build linear model, appears to be very linear
+plot(Fight_Data$Reach_cms, Fight_Data$Height_cms)
+reach_lm <- lm(Reach_cms ~ Height_cms, data = Fight_Data)
+Fight_Data <- Fight_Data %>%
+  mutate(Reach_cms = ifelse(is.na(Reach_cms) == TRUE, predict(reach_lm, Fight_Data), Reach_cms))
+
+###Drop uneeded columns and make title bout a factor
+Fight_Data <- Fight_Data %>%
+  select(-date,
+         -Referee,
+         -location,
+         -Fight_ID,
+         -Fighter,
+         -draw) %>%
+  mutate(title_bout = ifelse(title_bout == FALSE,0,1))
+
+###Fix a few factor level issues
+Fight_Data$weight_class <- as.factor(Fight_Data$weight_class)
+Fight_Data$title_bout <- as.factor(Fight_Data$title_bout)
+Fight_Data$Stance <- as.factor(Fight_Data$Stance)
+Fight_Data <- drop_na(Fight_Data)
+```
+
+
+###Lets see if we can predict only using fighter stats, ignoring their opponent
+```{r}
+set.seed(12)
+
+###Train and test splits
+df    <- sample(nrow(Fight_Data), nrow(Fight_Data)*.8)
+train <- Fight_Data[df,]
+test  <- Fight_Data[-df,]
+
+```
+
+###Basic Tree and Pruning
+```{r}
+###So just to get an idea of our model, it thinks that the odds are good enough to make predictions
+train.tree <- tree(Winner ~ ., data = train)
+plot(train.tree)
+text(train.tree)
+
+###Check performance
+tree.predict <- predict(train.tree, test, type = "class")
+table(tree.predict, test$Winner)
+(406+97)/1372
+
+###Our simple model had a 37% test error rate or it was 63% accurate, not a bad starting point. We can then prune our tree to make it even better
+
+pruned.tree <- cv.tree(train.tree, FUN = prune.misclass)
+plot(pruned.tree$dev, pruned.tree$size)
+pruned.tree.final <- prune.misclass(train.tree, best = 3)
+pruned.predict <- predict(pruned.tree.final, test, type = "class")
+table(pruned.predict, test$Winner)
+(406+97)/1372
+
+###Store our results in a dataframe for later comparision
+Method<- c("Pruned Tree", "Boosted Tree", "XGBoost")
+Test_Error_Rate <- c("37",NA,NA)
+Results <- data.frame(Method, Test_Error_Rate)
+```
+
+###Boosted Trees
+```{r}
+###First we want to create a grid of parameters to use for tuning, we can create this and get a combo of 81 parameters
+hyper_grid <- expand.grid(
+  shrinkage = c(.01, .1, .3),
+  interaction.depth = c(1, 3, 5),
+  n.minobsinnode = c(5, 10, 15),
+  bag.fraction = c(.65, .8, 1), 
+  optimal_trees = 0,               # a place for results
+  min_RMSE = 0                     # a place for results
+)
+
+for(i in 1:nrow(hyper_grid)) {
+
+  # train model
+  gbm.tune <- gbm(
+    formula = Winner ~ .,
+    distribution = "bernoulli",
+    data = train,
+    n.trees = 5000,
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage =         hyper_grid$shrinkage[i],
+    n.minobsinnode =    hyper_grid$n.minobsinnode[i],
+    bag.fraction =      hyper_grid$bag.fraction[i],
+    train.fraction = .75,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  hyper_grid$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+
+hyper_grid %>% 
+  dplyr::arrange(min_RMSE) %>%
+  head(10)
+
+gbm.train <- gbm(
+    formula = Winner ~ .,
+    distribution = "bernoulli",
+    data = train,
+    n.trees = 64,
+    interaction.depth = 1,
+    shrinkage =         .1,
+    n.minobsinnode =    5,
+    bag.fraction =      .65,
+    train.fraction = 1,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+
+gbm.predict <- predict(gbm.train, n.trees = 64, test, type = "response")
+yhat.pred <- rep(0, length(gbm.predict))
+yhat.pred[gbm.predict > 0.5] = 1
+table(yhat.pred, test$Winner)
+mean(yhat.pred != test$Winner)
+
+####See the probabilities in our data frame
+options(pillar.sigfig=0)
+test %>%
+  mutate(predicted_prob = predict(gbm.train, test, type = "response")) %>%
+  relocate(predicted_prob)  %>%
+  mutate(across(is.numeric, ~ round(.,2)))
+  
+###See our importance, it really likes the odds
+par(mar = c(5, 8, 1, 1))
+summary(
+  gbm.train, 
+  cBars = 10,
+  method = relative.influence, # also can use permutation.test.gbm
+  las = 2
+  )
+
+###37% test error, so not that much better.
+###Store our results in a dataframe for later comparision
+Method<- c("Pruned Tree", "Boosted Tree", "XGBoost")
+Test_Error_Rate <- c("37","35",NA)
+Results <- data.frame(Method, Test_Error_Rate)
+```
+
+###I am curious if the accuracy of different divisions differs, there is a perception that Heavyweight fights are more unpredictable so we can check performance on each of the weight classes
+```{r}
+###There are 13 classes to consider
+levels(test$weight_class)
+
+###Check performance (test error rate by division)
+options(pillar.sigfig=0)
+Divisional_Breakdown <- test %>%
+  mutate(predicted_prob = ifelse(predict(gbm.train, test, type = "response")>.5,1,0)) %>%
+  relocate(predicted_prob)  %>%
+  mutate(across(is.numeric, ~ round(.,2))) %>%
+  mutate(Correct = ifelse(predicted_prob==Winner,1,0)) %>%
+  relocate(Correct) %>%
+  group_by(weight_class) %>%
+  summarise(Correct_Predictions = sum(Correct),
+            Fights = n(),
+            Percentage = Correct_Predictions/Fights) %>%
+  arrange(desc(Percentage))
+
+###Based on that data, it appears the ahrdest to predict are womens divisions (excluding straweight and the featherweight division because of lack of observations). We can also plot our results
+Divisional_Breakdown %>%
+  filter(weight_class != "WomenFeatherweight", weight_class != "CatchWeight") %>%
+  ggplot(aes(x=Percentage, y= reorder(weight_class, Percentage))) +
+  geom_bar(stat="identity", color="blue", fill="white")+
+  geom_vline(xintercept = .5, linetype = "dashed") +
+  ylab("Weight Class")+
+  geom_text(aes(label=Percentage), position=position_dodge(width=0.9), vjust=-0.25)
+
+###So heavyweight is 70% correct which is pretty solid! Some of the lighter weight classes appear to be a little harder to predict except for flyweight
+```
+
+###XGBoost Model
+```{r}
+###Now we can try an XGBoost model on our data, first XGBoost requires a numeric matrix so we have to convert our data frame to accomodate this with the vtreat package
+
+###Pick out our features
+features <- setdiff(names(train), "Winner")
+
+###From our training data we create a treatment plan
+treatplan <- designTreatmentsZ(train, features, verbose = FALSE)
+
+# Get the "clean" variable names from the scoreFrame, this takes any of the factor level ones and makes them new variables
+new_vars <- treatplan %>%
+  magrittr::use_series(scoreFrame) %>%        
+  dplyr::filter(code %in% c("clean", "lev")) %>% 
+  magrittr::use_series(varName)  
+
+###From there we can create our training data
+features_train <- prepare(treatplan, train, varRestriction = new_vars) %>% 
+  as.matrix()
+response_train <- train$Winner
+
+###Do the same to prepare our test data
+# Prepare the test data
+features_test <- prepare(treatplan, test, varRestriction = new_vars) %>% 
+  as.matrix()
+response_test <- test$Winner
+
+###Ensure our dimensions makes sense, looks good!
+dim(features_train)
+dim(features_test)
+
+###Now we create a grid to search through for the ideal parameters
+grid_size <- 40
+
+grid <- grid_latin_hypercube(
+  ###this bounds our model because mtry depends on the variables we are using as predictors, so it is finalize 1 through 87 variables for use
+  finalize(mtry(), features_train),
+  ###Child weight - minimum number of observations required in each terminal node
+  min_n(),
+  ###Depth of the tree
+  tree_depth(),
+  ###How slow or fast our model will learn
+  learn_rate(range = c(-1.5, -0.5), trans = log10_trans()),
+  ###A node is split only when the resulting split gives a positive reduction in the loss function. Gamma specifies the minimum loss reduction required to make a split.
+  loss_reduction(),
+  ###Denotes the fraction of observations to be randomly samples for each tree.
+  sample_size = sample_prop(),
+  ### Size of hyperparameter grid to search over
+  size = grid_size) %>%
+  ### Has to be between 0 and 1 for xgb and for some reason mtry gives the number of columns rather than proportion
+  mutate(mtry = mtry / length(features_train %>%
+  as.data.frame())) %>%
+  ###Rename so the model can interpret it
+  rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+
+###Did not do monotone contraints because I could not think of any definitve variables (such as point differential in another sports) that would fit into this but we can explore later
+
+###View our grid
+grid
+
+###Now we need a function that will go through the hyperparameter grid and return results into that grid for us to analyze
+get_row <- function(row){
+  ###Set up the parameters to use, it will pull in the row we establish
+  params <- list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = c("error"),
+    eta = row$eta,
+    gamma = row$gamma,
+    subsample = row$subsample,
+    colsample_bytree = row$colsample_bytree,
+    max_depth = row$max_depth,
+    min_child_weight = row$min_child_weight
+  )
+    ###Perform the xgboost cv
+  prediction.model.xgboost <- xgb.cv(
+    data = features_train,
+    label = response_train,
+    params = params,
+    # this doesn't matter with early stopping in xgb.cv, just set a big number, the actual optimal rounds will be found in this tuning process
+    nrounds = 15000,
+    # number of folds
+    nfold = 5,
+    metrics = list("error"),
+    # stop if no improvement for 50 consecutive trees
+    early_stopping_rounds = 50,
+    print_every_n = 50
+  )
+  
+  ### bundle up the results together for returning
+  output <- params
+  output$iter <- prediction.model.xgboost$best_iteration
+  output$error <- prediction.model.xgboost$evaluation_log[output$iter]$test_error_mean
+
+  row_result <- bind_rows(output)
+
+  return(row_result)
+ 
+}
+
+###Now we just run it on our hyperparameters
+results <- map_df(1:nrow(grid), function(x) {
+  get_row(grid %>% dplyr::slice(x))
+})
+
+###Quick look at results
+results %>%
+  arrange(error)
+
+###We can view the results following a tutorial from Julia Silge
+results %>%
+  dplyr::select(error, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, error, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "error") +
+  theme_minimal()
+
+###So we interpret this, we want the lowest for each. Max depth seems very variable but something in the range of 6-10 may suffice. A colsample by tree greater than .6, learning rate lower than .1. We can re run our model then with ranges to search over here.
+grid <- dials::grid_latin_hypercube(
+  # don't need the finalize business since we're using length in here
+  mtry((range = c(round(length(features_train %>% as.data.frame()) / 4), length(features_train %>% as.data.frame())))),
+  min_n(),
+  # force tree depth to be between 6 and 10
+  tree_depth(range = c(6L, 10L)),
+  # to force learn_rate to not be crazy small like dials defaults to
+  learn_rate(range = c(-1.5, -1), trans = log10_trans()),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = grid_size
+) %>%
+  dplyr::mutate(
+    # has to be between 0 and 1 for xgb
+    # for some reason mtry gives the number of columns rather than proportion
+    mtry = mtry / length(features_train %>% as.data.frame())
+  ) %>%
+  # make these the right names for xgb
+  dplyr::rename(
+    eta = learn_rate,
+    gamma = loss_reduction,
+    subsample = sample_size,
+    colsample_bytree = mtry,
+    max_depth = tree_depth,
+    min_child_weight = min_n
+  )
+
+###Rerun with our new grid
+results <- purrr::map_df(1:nrow(grid), function(x) {
+  get_row(grid %>% dplyr::slice(x))
+}) 
+
+
+##Result check again, I see a few strong combos
+results %>%
+  dplyr::select(error, eta, gamma, subsample, colsample_bytree, max_depth, min_child_weight) %>%
+  tidyr::pivot_longer(
+    eta:min_child_weight,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, error, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE, size = 3) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "error") +
+  theme_minimal()
+
+###Get best results and let it run
+best_model <- results %>%
+  dplyr::arrange(error) %>%
+  dplyr::slice(1)
+
+params <-
+  list(
+    booster = "gbtree",
+    objective = "binary:logistic",
+    eval_metric = c("error"),
+    eta = best_model$eta,
+    gamma = best_model$gamma,
+    subsample = best_model$subsample,
+    colsample_bytree = best_model$colsample_bytree,
+    max_depth = best_model$max_depth,
+    min_child_weight = best_model$min_child_weight
+  )
+
+nrounds <- best_model$iter
+###35 rounds
+glue::glue("nrounds: {nrounds}")
+
+###Train our model
+XGBoosted.train <- xgboost::xgboost(
+  params = params,
+  data = features_train,
+  label = response_train,
+  nrounds = nrounds,
+  verbose = 2
+)
+
+###Check out importance plots
+importance <- xgboost::xgb.importance(
+  feature_names = colnames(XGBoosted.train),
+  model = XGBoosted.train
+)
+xgboost::xgb.ggplot.importance(importance_matrix = importance)
+
+###So odds are very importance but then we have striking related and submission related stats, now let us do a prediction
+xgboosted.predict <- predict(XGBoosted.train, features_test, type = "response")
+yhat.pred <- rep(0, length(xgboosted.predict))
+yhat.pred[xgboosted.predict > 0.5] = 1
+table(yhat.pred, test$Winner)
+mean(yhat.pred != test$Winner)
+
+###So we get a 35% test error rate which is better and we can store it for comp
+Method<- c("Pruned Tree", "Boosted Tree", "XGBoost")
+Test_Error_Rate <- c("37","35","35")
+Results <- data.frame(Method, Test_Error_Rate)
+
+###In conclusion, my best model performed at about a 35% test error rate with XGBoost as the best model
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
