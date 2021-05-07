@@ -14,3 +14,9 @@ I used 3 different approaches.
       1. Pruned Trees
       2. Boosted Tree
       3. XGBoost
+
+3. Results 
+
+The XGBoost model performed best with a 35% test error rate. A plot is shown below displaying the results. 
+
+![XGBoost](https://user-images.githubusercontent.com/53879645/117492370-8428d100-af3f-11eb-844d-323d9baca16a.png)
